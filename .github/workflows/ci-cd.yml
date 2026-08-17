@@ -1,12 +1,22 @@
+# The pipeline: lint -> test (matrix) -> deploy -> smoke test.
+#
+# This file MUST live at .github/workflows/ at the root of the repository.
+# GitHub ignores a .github/ directory nested inside a subdirectory, and the
+# only symptom is an Actions tab that stays empty — no error, no warning.
 name: CI/CD
 
 on:
   push:
     branches: [main]
+  # No branch filter here, so tests run on PRs from any branch. The deploy job
+  # guards itself separately with `if: github.event_name == 'push'`.
   pull_request:
+  # Lets you re-run the pipeline from the Actions tab without pushing. Note that
+  # a manual run tests but never deploys, for the same reason.
   workflow_dispatch:
 
-# Cancel an in-flight run if you push again — keeps the demo tidy.
+# Cancel an in-flight run if you push again — keeps the demo tidy and stops a
+# superseded commit from racing a newer one to the deploy step.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,6 +26,8 @@ jobs:
     name: Lint & Test (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      # Let the other Python version finish instead of cancelling it the moment
+      # one fails — you usually want to know whether a break is version-specific.
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
@@ -27,35 +39,60 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          # Caches the pip download directory keyed on the requirements files.
+          # Because the project sits at the repo root, this finds them with no
+          # cache-dependency-path; it would need one if the app moved deeper.
           cache: pip
 
+      # requirements-dev.txt starts with `-r requirements.txt`, so this single
+      # install covers both runtime and test dependencies. Installing only
+      # requirements.txt here would fail at import: TestClient needs httpx.
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
       - name: Lint
         run: ruff check .
 
+      # pytest resolves `from main import app` via pythonpath in pyproject.toml.
+      # --junitxml writes machine-readable results for the upload step below.
       - name: Run tests
         run: pytest -q --junitxml=results.xml
 
       - name: Upload test results
+        # `always()` so the report is still uploaded when tests FAIL — that is
+        # precisely the run you want the artifact from.
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          # Name is per-version; two matrix jobs uploading the same artifact
+          # name would collide.
           name: test-results-py${{ matrix.python-version }}
           path: results.xml
 
   deploy:
     name: Deploy to Render
-    needs: test                                  # <-- the gate: no green tests, no deploy
+    # The gate: `needs` makes this job wait for BOTH matrix jobs, and a failure
+    # in either leaves this one skipped rather than run. Without it you have CD,
+    # not CI/CD — remove it and a red build still ships.
+    needs: test
+    # Belt and braces: `needs` blocks a broken build, and this blocks deploying
+    # from a PR or a manual run even when the tests are green.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    environment: production                      # optional: add a manual approval here
+    # Add yourself as a required reviewer under Settings -> Environments to make
+    # this job pause for manual approval. GitHub creates the environment on the
+    # first run if it does not exist.
+    environment: production
     steps:
       - name: Trigger Render deploy hook
         env:
+          # Passed via env rather than interpolated into the script below, so the
+          # URL never lands in the shell command line or the run log.
           RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
         run: |
+          # Unset secret is treated as "CI-only demo", not as a failure, so the
+          # workflow still goes green for anyone who clones this without a
+          # Render account.
           if [ -z "$RENDER_DEPLOY_HOOK" ]; then
             echo "::warning::RENDER_DEPLOY_HOOK is not set — skipping deploy."
             exit 0
@@ -64,9 +101,18 @@ jobs:
           echo "Deploy triggered for ${GITHUB_SHA::7}"
 
       - name: Smoke test the live app
+        # Skipped entirely unless you have set the APP_URL repository variable.
         if: vars.APP_URL != ''
         run: |
           echo "Waiting for ${{ vars.APP_URL }} to come back up..."
+          # The deploy hook returns 200 as soon as the build is QUEUED, so there
+          # is nothing to wait on synchronously — hence polling /health.
+          #
+          # CAVEAT: the previous version keeps serving /health while Render
+          # builds, so the first poll can succeed against the OLD deploy and
+          # report green. Comparing /health's `sha` against ${{ github.sha }}
+          # would make this check honest, but needs GIT_SHA set on the service
+          # first. See "Known gaps" in the README.
           for i in $(seq 1 30); do
             if curl -fsS "${{ vars.APP_URL }}/health" > /dev/null; then
               echo "Health check passed after ${i} attempt(s)."
@@ -78,6 +124,8 @@ jobs:
           exit 1
 
       - name: Summary
+        # `always()` so you still get the summary when the smoke test fails.
+        # $GITHUB_STEP_SUMMARY renders as markdown on the run's page.
         if: always()
         run: |
           echo "### Deploy summary" >> $GITHUB_STEP_SUMMARY
