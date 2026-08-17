@@ -39,7 +39,7 @@ class ReverseResponse(BaseModel):
 def root() -> dict[str, str]:
     # Demo beat 1 (green baseline): edit this string, push, and watch the new
     # text appear on the live URL once the deploy job finishes.
-    return {"msg": "Deployed by GitHub Actions"}
+    return {"msg": "Deployed by GitHub Actions — pipeline is live"}
 
 
 @app.get("/health")
