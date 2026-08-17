@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# Without this, `pytest` (the console script) puts tests/ on sys.path but not the
+# project root, so `from main import app` fails to import. See tests/test_main.py.
+pythonpath = ["."]
+testpaths = ["tests"]
